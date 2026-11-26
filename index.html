@@ -1,0 +1,969 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>ASCII Christmas Film - Mobile Edition</title>
+<style>
+  * {
+    box-sizing: border-box;
+    -webkit-tap-highlight-color: transparent;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100vw;
+    height: 100dvh;
+    overflow: hidden;
+    background: #323a47;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+  }
+  body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+  }
+  canvas {
+    display: block;
+    width: 100vw;
+    height: 100dvh;
+    touch-action: manipulation;
+    cursor: pointer;
+  }
+  /* 移动端底部轻量交互栏 */
+  #hud {
+    position: fixed;
+    bottom: max(16px, env(safe-area-inset-bottom, 16px));
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    gap: 10px;
+    z-index: 20;
+    pointer-events: auto;
+    opacity: 0.88;
+    transition: opacity 0.3s ease;
+  }
+  .btn {
+    background: rgba(26, 32, 44, 0.72);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    color: #ffe875;
+    border: 1px solid rgba(255, 224, 51, 0.35);
+    border-radius: 999px;
+    padding: 8px 16px;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    cursor: pointer;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
+    transition: transform 0.15s ease, background 0.2s ease;
+  }
+  .btn:active {
+    transform: scale(0.94);
+    background: rgba(255, 224, 51, 0.22);
+  }
+  #hud.show-cta {
+    animation: ctaIn 0.8s cubic-bezier(.2,.8,.2,1) both;
+  }
+  @keyframes ctaIn {
+    from { opacity:  0; transform: translate(-50%, 14px); }
+    to   { opacity: .96; transform: translate(-50%, 0); }
+  }
+  #hint {
+    position: fixed;
+    top: max(14px, env(safe-area-inset-top, 14px));
+    left: 50%;
+    transform: translateX(-50%);
+    color: rgba(255, 244, 194, 0.75);
+    font-size: 12px;
+    letter-spacing: 0.8px;
+    pointer-events: none;
+    text-shadow: 0 1px 4px rgba(0,0,0,0.5);
+    white-space: nowrap;
+  }
+</style>
+</head>
+<body>
+<div id="hint">圣诞树正在逐渐生成…</div>
+<canvas id="screen" aria-label="Animated ASCII Christmas tree"></canvas>
+<div id="hud" style="display:none;">
+  <button id="btnReplay" class="btn" type="button">↻ 重新播放</button>
+</div>
+
+<script>
+(() => {
+  "use strict";
+
+  const canvas = document.getElementById("screen");
+  const ctx = canvas.getContext("2d", { alpha: false });
+  const off = document.createElement("canvas");
+  const ox = off.getContext("2d");
+
+  const btnToggle = document.getElementById("btnToggle");
+  const btnReplay = document.getElementById("btnReplay");
+  const hintEl = document.getElementById("hint");
+
+  // 数学辅助函数
+  const clamp = (v, a = 0, b = 1) => Math.max(a, Math.min(b, v));
+  const mix = (a, b, t) => a + (b - a) * t;
+  const ease = t => {
+    t = clamp(t);
+    return t < 0.5 ? Math.pow(2 * t, 1.5) / 2 : 1 - Math.pow(2 * (1 - t), 1.5) / 2;
+  };
+  const back = t => {
+    const c = 1.70158;
+    return 1 + (c + 1) * Math.pow(t - 1, 3) + c * Math.pow(t - 1, 2);
+  };
+
+  let W, H, PW, CW, CH, AR, cols, rows, dpr;
+  let cells, colors, depth;
+  let started = false, paused = false, ended = false;
+  let startAt = 0, pauseAt = 0, lastT = 0;
+  let audio = null, bus = null, master = null, prevCue = -1, stepBell = 0;
+
+  // 检测是否支持原生 canvas filter（iOS Safari 旧版兼容处理）
+  const supportsFilter = typeof ctx.filter === "string";
+
+  // 确定性伪随机数生成器
+  const randSeed = (() => {
+    let s = 928371;
+    return () => {
+      s = (s * 1664525 + 1013904223) >>> 0;
+      return s / 4294967296;
+    };
+  })();
+
+  const points = [], lamps = [], snow = [], dust = [];
+
+  // 圣诞彩灯色相渐变表
+  const hueRamp = [318, 282, 228, 190, 150, 56, 38, 56, 150, 190, 228, 282, 318];
+
+  // 自适应响应式布局计算（兼容手机竖屏、平板与桌面）
+  function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    const isMobile = W < 640;
+
+    // 移动端保持 9:16 舞台比例，使字符点阵在手机屏幕上清晰饱满
+    PW = isMobile ? W : Math.min(W, H * 9 / 16);
+    const targetCols = isMobile ? 96 : 120;
+
+    CW = PW / targetCols;
+    CH = CW * 1.58;
+    AR = CW / CH;
+
+    cols = Math.max(84, Math.floor(W / CW));
+    rows = Math.max(60, Math.floor(H / CH));
+
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    off.width = Math.round(cols * CW * dpr);
+    off.height = Math.round(rows * CH * dpr);
+    ox.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    ox.font = `bold ${0.95 * CH}px Menlo, Consolas, "DejaVu Sans Mono", monospace`;
+    ox.textAlign = "center";
+    ox.textBaseline = "middle";
+  }
+
+  window.addEventListener("resize", resize);
+  resize();
+
+  // 生成圣诞树点云（优化移动端粒子数量以保证 60fps 流畅度）
+  function makeCloud() {
+    const isMobile = window.innerWidth < 640;
+    const pointCount = isMobile ? 48000 : 95000;
+    const lampCount = isMobile ? 2200 : 3800;
+
+    for (let i = 0; i < pointCount; i++) {
+      const tier = Math.floor(randSeed() * 6);
+      const u = randSeed();
+      const a = randSeed() * Math.PI * 2;
+      const heights = [0.205, 0.18, 0.155, 0.135, 0.115, 0.10];
+      const starts = [0, 0.20, 0.38, 0.55, 0.70, 0.84];
+      const f = starts[tier] + u * heights[tier];
+      const v = randSeed();
+      const lobes = [13, 11, 9, 8, 7, 6][tier];
+      const lobe = Math.cos(a * lobes + (randSeed() - 0.5) * 0.55);
+      const radial = (0.10 + 0.90 * Math.pow(v, 0.55)) * (0.58 + 0.42 * Math.max(0, lobe));
+      const tierR = [1.08, 0.80, 0.62, 0.46, 0.32, 0.19][tier];
+      const r = radial * tierR * (1 - 0.22 * u);
+      points.push({ f, r, a, tier, core: randSeed() < 0.30, seed: randSeed(), phase: randSeed() * 6.28 });
+    }
+
+    for (let i = 0; i < lampCount; i++) {
+      const tier = Math.floor(randSeed() * 6);
+      const a = randSeed() * Math.PI * 2;
+      const f = [0.04, 0.24, 0.42, 0.59, 0.74, 0.88][tier] + randSeed() * 0.09;
+      lamps.push({
+        f,
+        r: [1.08, 0.80, 0.62, 0.46, 0.32, 0.19][tier] * (0.96 + randSeed() * 0.07),
+        a,
+        seed: randSeed(),
+        gold: randSeed() < 0.16
+      });
+    }
+
+    for (let i = 0; i < 180; i++) {
+      snow.push({ x: randSeed() * 140, y: randSeed() * 140, s: 1.5 + randSeed() * 3.5, p: randSeed() * 6.28, z: randSeed() });
+    }
+    for (let i = 0; i < 130; i++) {
+      dust.push({ a: randSeed() * 6.28, r: 0.15 + randSeed() * 0.95, y: randSeed(), s: 0.3 + randSeed() * 0.7 });
+    }
+  }
+  makeCloud();
+
+  // Z-buffer 字符写入
+  function put(x, y, ch, color, z = 1) {
+    x = Math.round(x);
+    y = Math.round(y);
+    if (x < 0 || x >= cols || y < 0 || y >= rows) return;
+    const i = y * cols + x;
+    if (z < depth[i]) return;
+    depth[i] = z;
+    cells[i] = ch;
+    colors[i] = color;
+  }
+
+  function textAt(x, y, str, color, z = 10) {
+    for (let i = 0; i < str.length; i++) put(x + i, y, str[i], color, z);
+  }
+
+  function ellipse(cx, cy, rx, ry, fn, z = 0) {
+    const xmin = Math.max(0, Math.floor(cx - rx));
+    const xmax = Math.min(cols - 1, Math.ceil(cx + rx));
+    const ymin = Math.max(0, Math.floor(cy - ry));
+    const ymax = Math.min(rows - 1, Math.ceil(cy + ry));
+    for (let y = ymin; y <= ymax; y++) {
+      for (let x = xmin; x <= xmax; x++) {
+        const d = Math.hypot((x - cx) / rx, (y - cy) / ry);
+        if (d <= 1) {
+          const q = fn(d, x, y);
+          if (q) put(x, y, q.ch, q.color, z);
+        }
+      }
+    }
+  }
+
+  // WebAudio 合成器（无外部音频依赖）
+  function audioStart() {
+    try {
+      if (audio) return audio.resume();
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      audio = new AC();
+      bus = audio.createGain();
+      const dry = audio.createGain();
+      const wet = audio.createGain();
+      const conv = audio.createConvolver();
+      dry.gain.value = 0.85;
+      wet.gain.value = 0.32;
+      master = audio.createGain();
+      master.gain.value = 1.25;
+
+      const n = Math.floor(audio.sampleRate * 2.0);
+      const buf = audio.createBuffer(2, n, audio.sampleRate);
+      for (let c = 0; c < 2; c++) {
+        const d = buf.getChannelData(c);
+        for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / n, 3);
+      }
+      conv.buffer = buf;
+      bus.connect(dry);
+      bus.connect(conv);
+      conv.connect(wet);
+      dry.connect(master);
+      wet.connect(master);
+
+      const comp = audio.createDynamicsCompressor();
+      comp.threshold.value = -16;
+      comp.ratio.value = 4;
+      master.connect(comp);
+      comp.connect(audio.destination);
+      return audio.resume();
+    } catch (e) {
+      // 忽略静音模式限制
+    }
+  }
+
+  function env(g, t, dur, peak) {
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(Math.max(0.0002, peak), t + 0.004);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  }
+
+  function tone(freq, dur = 0.5, vol = 0.06, type = "sine", pan = 0) {
+    if (!audio || audio.state !== "running") return;
+    const t = audio.currentTime;
+    const o = audio.createOscillator();
+    const g = audio.createGain();
+    const p = audio.createStereoPanner ? audio.createStereoPanner() : null;
+    o.type = type;
+    o.frequency.setValueAtTime(freq, t);
+    if (p) {
+      p.pan.value = pan;
+      o.connect(g);
+      g.connect(p);
+      p.connect(bus);
+    } else {
+      o.connect(g);
+      g.connect(bus);
+    }
+    env(g, t, dur, vol);
+    o.start(t);
+    o.stop(t + dur + 0.02);
+  }
+
+  function bell(index, vol = 0.055, pan = 0, dur = 1) {
+    const scale = [0, 2, 4, 7, 9];
+    const oct = Math.floor(index / 5);
+    const semi = scale[(index % 5 + 5) % 5] + 12 * oct;
+    const f = 523.25 * Math.pow(2, semi / 12);
+    [1, 2.76, 5.4].forEach((m, i) => tone(f * m, dur, vol * [1, 0.2, 0.07][i], "sine", pan));
+  }
+
+  function noise(dur = 0.5, vol = 0.025, lo = 900, hi = 3200, pan = 0) {
+    if (!audio || audio.state !== "running") return;
+    const t = audio.currentTime;
+    const n = Math.ceil(audio.sampleRate * dur);
+    const b = audio.createBuffer(1, n, audio.sampleRate);
+    const d = b.getChannelData(0);
+    for (let i = 0; i < n; i++) d[i] = Math.random() * 2 - 1;
+    const src = audio.createBufferSource();
+    const f = audio.createBiquadFilter();
+    const g = audio.createGain();
+    src.buffer = b;
+    f.type = "bandpass";
+    f.frequency.setValueAtTime(lo, t);
+    f.frequency.linearRampToValueAtTime(hi, t + dur * 0.8);
+    f.Q.value = 0.8;
+    src.connect(f);
+    f.connect(g);
+    g.connect(bus);
+    env(g, t, dur, vol);
+    src.start(t);
+    src.stop(t + dur + 0.01);
+  }
+
+  function glide(a, b, dur = 0.4, vol = 0.04, type = "sine", pan = 0) {
+    if (!audio || audio.state !== "running") return;
+    const t = audio.currentTime;
+    const o = audio.createOscillator();
+    const g = audio.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(a, t);
+    o.frequency.exponentialRampToValueAtTime(b, t + dur);
+    o.connect(g);
+    g.connect(bus);
+    env(g, t, dur, vol);
+    o.start(t);
+    o.stop(t + dur + 0.02);
+  }
+
+  function cue(t) {
+    const cues = [0.05, 0.39, 1.05, 1.2, 5.27, 5.65, 5.95, 8.95, 9.05, 9.31, 9.57, 9.83, 10.09, 10.55];
+    for (let i = 0; i < cues.length; i++) {
+      if (lastT < cues[i] && t >= cues[i]) {
+        switch (i) {
+          case 0:
+            glide(2400, 620, 0.34, 0.035);
+            bell(17, 0.035, 0.2, 0.6);
+            break;
+          case 1:
+            tone(120, 0.8, 0.10);
+            glide(120, 44, 0.65, 0.08);
+            noise(1.2, 0.07, 180, 1200);
+            bell(-5, 0.06, -0.3, 2);
+            bell(-2, 0.05, 0.3, 2);
+            break;
+          case 2:
+            for (let j = 0; j < 6; j++) {
+              tone(115 + j * 24, 0.16, 0.035, "triangle");
+              noise(0.07, 0.018, 600, 1600);
+            }
+            break;
+          case 3:
+            glide(330, 990, 0.6, 0.05);
+            noise(0.6, 0.04, 500, 2600);
+            break;
+          case 4:
+            for (let j = 0; j < 5; j++) bell(14 + j, 0.05, (j - 2) * 0.12, 0.5);
+            break;
+          case 5:
+            [0, 2, 4, 7].forEach((v, j) => setTimeout(() => bell(12 + v, 0.08, j % 2 ? -0.5 : 0.5, 2), 0));
+            noise(0.8, 0.025, 5000, 9000);
+            break;
+          case 6:
+            glide(1600, 180, 0.8, 0.045);
+            for (let j = 0; j < 24; j++) setTimeout(() => bell(13 - Math.floor(j / 4), 0.032, j % 2 ? -0.8 : 0.8, 0.7), j * 125);
+            break;
+          case 7:
+            [-5, -3, 0, 2].forEach((v, j) => bell(v, 0.055, j % 2 ? -0.5 : 0.5, 3));
+            bell(9, 0.06, 0, 1);
+            break;
+          case 8:
+            glide(220, 700, 0.075, 0.05);
+            noise(0.08, 0.025, 1000, 5000);
+            bell(12, 0.05, 0, 0.6);
+            break;
+          case 9:
+          case 10:
+          case 11:
+          case 12:
+          case 13:
+            bell(12 + i, 0.06, (i % 2 ? -0.7 : 0.7), 0.8);
+            break;
+        }
+      }
+    }
+    if (t >= 1.8 && t < 5.4) {
+      const step = Math.floor((t - 1.8) / 0.09);
+      while (stepBell < step) {
+        if (Math.random() < 0.75) bell(19 + Math.floor(Math.random() * 9), 0.012, Math.random() * 1.6 - 0.8, 0.35);
+        stepBell++;
+      }
+    }
+    if (t >= 5.95 && t < 8.95) {
+      const k = Math.floor((t - 5.95) / 0.125);
+      while (prevCue < k) {
+        prevCue++;
+        bell(13 - Math.floor(prevCue / 5), 0.025, prevCue % 2 ? -0.8 : 0.8, 0.65);
+      }
+    }
+  }
+
+  /**
+   * 圣诞树顶部的明亮黄色星星（已修复调用逻辑并强化金黄发光表现）
+   */
+  function star(cx, tip, t, scaleX) {
+    const pulse = 0.5 + 0.5 * Math.sin(t * 3.2);
+    // 明亮温暖的金黄色调 (#FFE033 ~ #FFF394)
+    const brightYellow = `hsl(48, 100%, ${66 + 16 * pulse}%)`;
+    const coreWhiteYellow = `hsl(52, 100%, ${84 + 12 * pulse}%)`;
+    const warmAmber = `hsl(42, 98%, ${54 + 10 * pulse}%)`;
+
+    // 树冠尚未完全长高前，顶部显示闪烁的黄色星种
+    if (t < 5.27) {
+      const prePulse = 0.5 + 0.5 * Math.sin(t * 7);
+      put(cx, tip, prePulse > 0.5 ? "*" : "+", brightYellow, 35);
+      if (t > 3.6) {
+        put(cx - 1, tip, ".", warmAmber, 34);
+        put(cx + 1, tip, ".", warmAmber, 34);
+        put(cx, tip - 1, ".", warmAmber, 34);
+      }
+      return;
+    }
+
+    // t >= 5.27s 时黄色大星星盛大绽放
+    const s = clamp((t - 5.27) / 0.48);
+    const es = back(ease(s));
+    const r = Math.max(1, Math.floor(1 + 2.2 * clamp(es)));
+
+    // 1. 绘制五角星立体内核（考虑字符宽高比 AR 进行垂直校准）
+    for (let y = -r; y <= r; y++) {
+      for (let x = -r; x <= r; x++) {
+        const dy = y / AR;
+        const dist = Math.hypot(x, dy);
+        if (dist <= r + 0.6) {
+          const isCenter = Math.abs(x) <= 0.5 && Math.abs(y) <= 0.5;
+          const isAxis = x === 0 || y === 0;
+          put(
+            cx + x,
+            tip + y,
+            isCenter ? "@" : isAxis ? "*" : "#",
+            isCenter ? coreWhiteYellow : brightYellow,
+            45
+          );
+        }
+      }
+    }
+
+    // 2. 绘制八方向放射状金黄色光芒射线
+    const rayScale = clamp(scaleX / 44, 0.72, 1.15) * clamp(es);
+    const rays = [
+      [0, -1, Math.round(9 * rayScale)],   // 正上光芒
+      [0, 1, Math.round(7 * rayScale)],    // 正下光芒
+      [-1, 0, Math.round(12 * rayScale)],  // 正左光芒
+      [1, 0, Math.round(12 * rayScale)],   // 正右光芒
+      [-1, -1, Math.round(5 * rayScale)],  // 左上斜芒
+      [1, -1, Math.round(5 * rayScale)],   // 右上斜芒
+      [-1, 1, Math.round(5 * rayScale)],   // 左下斜芒
+      [1, 1, Math.round(5 * rayScale)]     // 右下斜芒
+    ];
+
+    rays.forEach(([dx, dy, n]) => {
+      for (let j = r + 1; j < n; j++) {
+        const px = cx + dx * j;
+        const py = tip + dy * j * (dy !== 0 ? AR * 1.15 : 1);
+        const ch = dx && dy ? (dx * dy > 0 ? "\\" : "/") : dx ? "-" : "|";
+        const col = j < r + 3 ? brightYellow : warmAmber;
+        put(px, py, ch, col, 44);
+      }
+      const endX = cx + dx * n;
+      const endY = tip + dy * n * (dy !== 0 ? AR * 1.15 : 1);
+      put(endX, endY, ".", brightYellow, 44);
+    });
+
+    // 3. 环绕星星旋转的金色星尘粒子
+    for (let i = 0; i < 14; i++) {
+      const a = (i * Math.PI * 2) / 14 + t * 0.45;
+      const radX = (7.5 + 1.5 * Math.sin(t * 3 + i)) * rayScale;
+      const radY = radX * AR;
+      const sx = cx + Math.cos(a) * radX;
+      const sy = tip + Math.sin(a) * radY;
+      put(sx, sy, i % 2 === 0 ? "*" : "+", i % 3 === 0 ? coreWhiteYellow : brightYellow, 43);
+    }
+  }
+
+  function draw(t) {
+    cells = new Array(cols * rows).fill("");
+    colors = new Array(cols * rows);
+    depth = new Float32Array(cols * rows);
+    depth.fill(-1e9);
+
+    const cx = cols / 2;
+    const base = rows * 0.72;
+    const treeH = rows * 0.45;
+    const tip = base - treeH;
+    const rot = t * 0.5;
+    const ground = rows * 0.855;
+
+    // 核心修复：动态计算适配屏幕宽度的树冠水平半径，防止手机端左右裁切
+    const treeSpanX = Math.min(cols * 0.42, (rows * 0.34) / AR);
+    const discRx = Math.min(cols * 0.44, treeSpanX * 1.05);
+
+    const growth = clamp((t - 1.8) / 4.35);
+    const F = ease(growth) * 1.12;
+
+    // 1. 背景飘落雪花
+    for (const s of snow) {
+      const y = (s.y + t * s.s * 0.42) % rows;
+      const x = ((s.x + Math.sin(t * 0.65 + s.p) * 1.15) % cols + cols) % cols;
+      put(x, y, "+", `rgba(248,250,255,${0.22 + s.z * 0.78})`, -20);
+    }
+
+    // 2. 环绕圣诞树的螺旋星尘
+    if (F > 0.3) {
+      for (const d of dust) {
+        const a = d.a + t * 0.18 * (0.4 + d.s);
+        const f = (d.y + t * 0.045 * d.s) % 1;
+        const r = (0.15 + d.r * 0.9) * Math.sin(f * Math.PI);
+        const x = cx + r * (treeSpanX * 0.88) * Math.sin(a);
+        const y = base - f * treeH;
+        put(x, y, d.s > 0.8 ? "*" : ".", `hsla(${mix(185, 315, d.r)},75%,78%,0.55)`, 2);
+      }
+    }
+
+    // 3. 底部金色雕花舞台圆盘
+    const disc = clamp((t - 0.39) / 1.0);
+    if (disc > 0) {
+      const rx = discRx * disc;
+      const ry = rx * AR * 0.28;
+      ellipse(
+        cx,
+        ground,
+        rx,
+        ry,
+        d => ({
+          ch: d > 0.96 ? "=" : d > 0.91 ? "#" : Math.random() < 0.70 ? "-" : null,
+          color: `hsl(46,${mix(16, 34, 1 - d)}%,${mix(28, 42, 1 - d)}%)`
+        }),
+        -5
+      );
+      for (let k = 0; k < 2; k++) {
+        const rr = (0.91 + k * 0.055) * disc;
+        for (let a = 0; a < Math.PI * 2; a += 0.03) {
+          const x = cx + Math.cos(a) * discRx * rr;
+          const y = ground + Math.sin(a) * discRx * rr * AR * 0.28;
+          put(x, y, k ? "=" : "#", `hsl(46,25%,${55 + 8 * Math.sin(t * 2 + a)}%)`, 0);
+        }
+      }
+      for (let i = 0; i < 16; i++) {
+        const a = (i * Math.PI) / 8 + rot * 0.25;
+        for (let q = 0.25; q < 0.92; q += 0.09) {
+          const x = cx + Math.cos(a) * q * (discRx * 0.76) * disc;
+          const y = ground + Math.sin(a) * q * (discRx * 0.76) * AR * 0.28;
+          put(x, y, q > 0.8 ? "#" : "+", "hsl(46,28%,62%)", 1);
+        }
+      }
+    }
+
+    // 4. 舞台出场冲击波与火花
+    if (t > 0.39 && t < 1.39) {
+      const p = t - 0.39;
+      for (let k = 0; k < 3; k++) {
+        const r = p * (discRx * 0.22 + k * (discRx * 0.12));
+        for (let a = 0; a < Math.PI * 2; a += 0.05) {
+          put(cx + Math.cos(a) * r, ground + Math.sin(a) * r * AR * 0.28, "#", `hsl(44,55%,${70 - k * 9}%)`, 4);
+        }
+      }
+      for (let i = 0; i < 65; i++) {
+        const a = i * 2.399;
+        const life = (t - 0.39) * 1.2 + (i % 9) * 0.009;
+        if (life < 1) {
+          const rr = life * (discRx * 0.14 + (i % 13));
+          put(
+            cx + Math.cos(a) * rr,
+            ground - life * 14 + life * life * 9 + Math.sin(a) * rr * 0.18,
+            life < 0.35 ? "*" : life < 0.7 ? "+" : ".",
+            "hsl(42,80%,75%)",
+            5
+          );
+        }
+      }
+    }
+
+    // 5. 圣诞树树干生长
+    const trunkP = clamp((t - 1.05) / 0.45);
+    const trunkRows = Math.floor(trunkP * treeH * 0.19);
+    const trunkBaseHalf = Math.max(1.8, treeSpanX * 0.055);
+    for (let y = 0; y < trunkRows; y++) {
+      const yy = base - y;
+      const half = trunkBaseHalf + (trunkBaseHalf * 0.65) * (y / Math.max(1, trunkRows));
+      for (let x = Math.floor(cx - half); x <= cx + half; x++) {
+        const sh = 1 - Math.abs(x - cx) / half;
+        put(x, yy, ["#", "8", "%", "@"][Math.floor(Math.abs(x * 7 + y * 3) % 4)], `hsl(20,46%,${4 + sh * 14}%)`, 3);
+      }
+    }
+
+    // 6. 六层圣诞树主枝叶点云（使用适配后的 treeSpanX，完整展示整棵树）
+    for (const p of points) {
+      if (F < p.f) continue;
+      const age = clamp(((F - p.f) * treeH) / 3);
+      const phi = p.a + rot;
+      const z = p.r * Math.cos(phi);
+      const x = cx + p.r * treeSpanX * Math.sin(phi);
+      const droop = Math.pow(p.r, 2) * (treeH * 0.085);
+      const y = base - p.f * treeH + droop + z * (treeSpanX * 0.14) * AR;
+
+      const left = Math.cos(phi) > 0.05;
+      const branch = Math.pow(p.r, 1.5);
+      const shade = clamp(0.14 + branch * 0.38 + (left ? 0.34 : -0.12) + (p.seed - 0.5) * 0.12);
+      const tierShadow = p.f % 0.2 > 0.16 ? 0.48 : 1;
+      let light = clamp(shade * tierShadow * 100, 6, 72);
+      let hue = 150 + (p.seed - 0.5) * 7;
+      let sat = 72 - (1 - shade) * 22;
+
+      if (age < 1) light = mix(6, light, age);
+      const frost = clamp((age - 0.35) * 0.45) * clamp((shade - 0.52) * 2) * (0.5 + 0.5 * Math.sin(p.a * 8));
+      if (frost > 0.7) {
+        hue = 46;
+        sat = 4;
+        light = mix(light, 97, (frost - 0.7) * 0.8);
+      }
+
+      let glyph = p.core ? "8" : light < 18 ? "8" : light < 32 ? "&" : light < 48 ? "%" : light < 62 ? "#" : "@";
+      if (age < 0.25) glyph = "#";
+      if (p.seed > 0.9992 && Math.sin(t * 8 + p.phase) > 0) glyph = "*";
+
+      put(x, y, glyph, `hsl(${hue},${sat}%,${light}%)`, 8 + z * 0.01);
+    }
+
+    // 7. 树干前景遮挡层
+    if (trunkP > 0) {
+      for (let y = 0; y < trunkRows; y++) {
+        const yy = base - y;
+        const half = trunkBaseHalf + (trunkBaseHalf * 0.7) * (y / Math.max(1, trunkRows));
+        for (let x = Math.floor(cx - half); x <= cx + half; x++) {
+          put(x, yy, (x + y) % 3 ? "#" : "8", `hsl(20,46%,${4 + 14 * (1 - Math.abs(x - cx) / half)}%)`, 20);
+        }
+      }
+    }
+
+    // 8. 红色圣诞挂球装饰
+    for (let k = 0; k < 22; k++) {
+      const tier = k % 6;
+      const a = k * 2.399;
+      const f = [0.035, 0.235, 0.415, 0.585, 0.735, 0.885][tier];
+      const r = [1.08, 0.80, 0.62, 0.46, 0.32, 0.19][tier] * (0.78 + 0.16 * Math.sin(k * 3));
+      if (F < f) continue;
+
+      const phi = a + rot;
+      const x = cx + r * treeSpanX * Math.sin(phi);
+      const z = r * Math.cos(phi);
+      const y = base - f * treeH + Math.pow(r, 2) * (treeH * 0.085) + z * (treeSpanX * 0.14) * AR + 1.5;
+      const drop = ease(clamp(((F - f) * treeH) / 4));
+      const yy = y + (1 - drop) * 2;
+      const c = `hsl(354,82%,${44 + 12 * Math.sin(t * 3 + k)}%)`;
+
+      textAt(x - 1, yy, "@@@", c, 25);
+      textAt(x - 1, yy + 1, "@O@", c, 25);
+      put(x - 1, yy, "*", "#fff5e9", 26);
+    }
+
+    // 9. 树身生长光环扫描特效
+    if (t >= 1.8 && t < 6.2) {
+      const rf = clamp((t - 1.8) / 4.35);
+      const f = rf * 0.98;
+      const radius = (0.12 + 0.88 * (1 - f)) * [1.08, 0.8, 0.62, 0.46, 0.32, 0.19][Math.min(5, Math.floor(f * 6))] * treeSpanX * 1.12 + 1.5;
+      const passed = clamp((t - 1.2) / 0.6);
+
+      for (let a = 0; a < Math.PI * 2 * passed; a += 0.03) {
+        const ang = a - rot * 0.65;
+        for (let k = 0; k < 3; k++) {
+          const rr = radius * (1 + k * 0.035);
+          const x = cx + Math.sin(ang) * rr;
+          const y = base - f * treeH + Math.cos(ang) * rr * 0.17 * AR - k;
+          put(x, y, "#", k === 0 ? "hsl(46,10%,96%)" : `hsl(${(a * 57 + t * 90 + k * 45) % 360},85%,${68 - k * 9}%)`, 24 + k);
+        }
+      }
+    }
+
+    // 10. 顶部黄色星星渲染（关键修复：在 draw 中调用 star()）
+    if (t >= 1.8 || !started) {
+      const starTime = started ? t : 6.5 + Math.sin(t * 2) * 0.5;
+      const starY = started && t < 5.27 ? mix(base - treeH * 0.2, tip - 1, clamp((t - 1.8) / 3.47)) : tip - 1;
+      star(cx, starY, starTime, treeSpanX);
+    }
+
+    // 11. 彩灯彗星螺旋点亮
+    const lightTime = started ? t : 9.2;
+    if (lightTime >= 5.95) {
+      const progress = clamp((lightTime - 5.95) / 3);
+      for (let side = 0; side < 2; side++) {
+        for (let j = 0; j < 100; j++) {
+          const q = j / 99;
+          const f = 1 - q;
+          const a = side * Math.PI + q * Math.PI * 8 + rot;
+          const r = [1.08, 0.80, 0.62, 0.46, 0.32, 0.19][Math.min(5, Math.floor(f * 6))] * treeSpanX * 1.08;
+          const x = cx + Math.sin(a) * r;
+          const y = base - f * treeH + Math.cos(a) * r * 0.17 * AR;
+          if (q <= progress) {
+            const hue = hueRamp[Math.floor((j / 99) * (hueRamp.length - 1))];
+            put(x, y, j < 15 ? "@" : j < 38 ? "#" : j < 65 ? "*" : ".", `hsl(${hue},100%,${58 + 12 * Math.sin(t * 9 + j)}%)`, 28);
+          }
+        }
+        const q = progress;
+        const aa = side * Math.PI + q * Math.PI * 8 + rot;
+        const rr = [1.08, 0.80, 0.62, 0.46, 0.32, 0.19][Math.min(5, Math.floor((1 - q) * 6))] * treeSpanX * 1.08;
+        const hx = cx + Math.sin(aa) * rr;
+        const hy = base - q * treeH + Math.cos(aa) * rr * 0.17 * AR;
+        put(hx, hy, "@", "#fff", 40);
+        put(hx - 1, hy, "@", `hsl(${side ? 282 : 318},100%,65%)`, 39);
+        put(hx + 1, hy, "@", `hsl(${side ? 190 : 56},100%,65%)`, 39);
+      }
+
+      for (const l of lamps) {
+        const q = clamp((lightTime - 5.95) / 3);
+        if (q > 1 - l.f) {
+          const a = l.a + rot;
+          const r = l.r * treeSpanX;
+          const x = cx + Math.sin(a) * r;
+          const y = base - l.f * treeH + Math.cos(a) * r * 0.17 * AR;
+          const hue = l.gold ? 46 : hueRamp[Math.floor(((l.a % (Math.PI * 2)) / (Math.PI * 2)) * (hueRamp.length - 1))];
+          if (l.seed > 0.25) {
+            put(x, y, ["@", "o", "*", "0"][Math.floor((t * 3 + l.seed * 4) % 4)], `hsl(${hue},100%,${58 + 10 * Math.sin(t * 7 + l.seed * 20)}%)`, 27);
+          }
+        }
+      }
+    }
+
+    // 12. 树下五个礼物盒依次弹出
+    const giftCols = ["#d81735", "#d5a33a", "#24784c", "#3479b7", "#bd4b9c"];
+    const ribbon = ["#e8c56c", "#c73a35", "#d5bb68", "#e6c66e", "#e8c56c"];
+    const giftDist = discRx * 0.34;
+    for (let i = 0; i < 5; i++) {
+      const p = clamp((t - (9 + i * 0.26)) / 0.42);
+      if (!p) continue;
+      const sc = Math.max(0, back(ease(p)));
+      const a = (i * 6.283) / 5 + rot * 0.25;
+      const x = cx + Math.sin(a) * giftDist;
+      const y = ground - 2.5 + Math.cos(a) * 1.8;
+      const w = [4.5, 4, 6, 3.5, 4.5][i] * sc * (treeSpanX / 42);
+      const h = [4.5, 4, 3.2, 6, 4.5][i] * sc * (treeSpanX / 42);
+
+      for (let yy = 0; yy < h; yy++) {
+        for (let xx = -w / 2; xx <= w / 2; xx++) {
+          const isRibbon = Math.abs(xx) < 0.8 || yy === Math.floor(h * 0.55);
+          put(x + xx, y - yy, isRibbon ? (yy === Math.floor(h) - 1 ? "=" : "|") : ["#", "@", "%", "&", "8"][Math.floor((xx + yy + i) % 5)], giftCols[i], 50);
+        }
+      }
+      for (let xx = -w / 2; xx <= w / 2; xx++) put(x + xx, y - h, "#", ribbon[i], 52);
+      put(x - 1, y - h - 1, "@", ribbon[i], 52);
+      put(x + 1, y - h - 1, "@", ribbon[i], 52);
+    }
+
+    // 13. 奔跑的 ASCII 驯鹿剪影
+    if (t >= 10.55) {
+      const p = clamp((t - 10.55) / 1.4);
+      const scale = Math.max(0.05, back(ease(p))) * (treeSpanX / 44);
+      const x0 = cx + Math.sin(t * 6) * 1.4;
+      const y0 = base - treeH * 0.22 + Math.sin(t * 6) * 1.2;
+      const pose = t * 6.28;
+      const leg = Math.sin(pose);
+      const white = "#f5f7fa";
+      const blue = "#c6d9e8";
+
+      const drawLine = (x1, y1, x2, y2, ch = "@") => {
+        const n = Math.max(1, Math.ceil(Math.hypot(x2 - x1, y2 - y1) * 2));
+        for (let k = 0; k <= n; k++) {
+          const q = k / n;
+          put(x0 + mix(x1, x2, q) * scale, y0 + mix(y1, y2, q) * scale, ch, white, 60);
+        }
+      };
+
+      const body = [[-10, 0, 5, 2], [-5, -1, 6, 3], [1, -3, 3, 2], [3, -5, 2, 2]];
+      body.forEach(([bx, by, rx, ry]) => {
+        for (let yy = -ry; yy <= ry; yy++) {
+          for (let xx = -rx; xx <= rx; xx++) {
+            if ((xx * xx) / (rx * rx) + (yy * yy) / (ry * ry) < 1.1) {
+              put(x0 + (bx + xx) * scale, y0 + (by + yy) * scale, (Math.abs(xx) + Math.abs(yy)) % 4 ? "@" : "+", white, 60);
+            }
+          }
+        }
+      });
+
+      drawLine(1, -3, 5, -8);
+      drawLine(5, -8, 9, -9);
+      drawLine(8, -9, 10, -10);
+      drawLine(7, -9, 8, -11);
+      drawLine(5, -9, 4, -11);
+      drawLine(5, -8, 3, -10);
+      drawLine(-11, -1, -14, -4);
+      drawLine(-14, -4, -16, -5);
+
+      const stride = leg * 3;
+      drawLine(-8, 1, -10 + stride, 6);
+      drawLine(-10 + stride, 6, -12 + stride, 8);
+      drawLine(-3, 1, -1 - stride, 5);
+      drawLine(-1 - stride, 5, 1 - stride, 8);
+      drawLine(0, -1, 3 + stride, 4);
+      drawLine(3 + stride, 4, 5 + stride, 7);
+      drawLine(3, -1, 6 - stride, 3);
+      drawLine(6 - stride, 3, 8 - stride, 5);
+
+      for (let i = 0; i < 24; i++) {
+        const xx = x0 + (randSeed() * 22 - 11) * scale;
+        const yy = y0 + (randSeed() * 9 - 5) * scale;
+        put(xx, yy, Math.random() < 0.5 ? "+" : "*", blue, 59);
+      }
+    }
+
+    // 将字符网格渲染到离屏 Canvas
+    ox.clearRect(0, 0, cols * CW, rows * CH);
+    for (let i = 0; i < cells.length; i++) {
+      if (cells[i]) {
+        const x = (i % cols) * CW;
+        const y = Math.floor(i / cols) * CH;
+        ox.fillStyle = colors[i] || "#fff";
+        ox.fillText(cells[i], x + CW / 2, y + CH / 2);
+      }
+    }
+
+    // 绘制夜空背景渐变
+    const grad = ctx.createLinearGradient(0, 0, 0, H);
+    grad.addColorStop(0, "#242b38");
+    grad.addColorStop(0.55, "#323b4a");
+    grad.addColorStop(0.86, "#444e5e");
+    grad.addColorStop(1, "#586273");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, H);
+
+    const gx = (W - cols * CW) / 2;
+    ctx.drawImage(off, 0, 0, cols * CW * dpr, rows * CH * dpr, gx, 0, cols * CW, rows * CH);
+
+    // 霓虹辉光层（带 iOS Safari 兼容性降级）
+    ctx.save();
+    ctx.globalCompositeOperation = "screen";
+    if (supportsFilter) {
+      ctx.globalAlpha = 0.42;
+      ctx.filter = `blur(${Math.max(2, PW * 0.006)}px)`;
+      ctx.drawImage(off, 0, 0, cols * CW * dpr, rows * CH * dpr, gx, 0, cols * CW, rows * CH);
+      ctx.globalAlpha = 0.16;
+      ctx.filter = `blur(${Math.max(6, PW * 0.018)}px)`;
+      ctx.drawImage(off, 0, 0, cols * CW * dpr, rows * CH * dpr, gx, 0, cols * CW, rows * CH);
+    } else {
+      // 不支持 ctx.filter 的移动端浏览器使用多偏移叠加强化星光与彩灯辉光
+      ctx.globalAlpha = 0.24;
+      ctx.drawImage(off, 0, 0, cols * CW * dpr, rows * CH * dpr, gx - 1.2, 0, cols * CW, rows * CH);
+      ctx.drawImage(off, 0, 0, cols * CW * dpr, rows * CH * dpr, gx + 1.2, 0, cols * CW, rows * CH);
+      ctx.drawImage(off, 0, 0, cols * CW * dpr, rows * CH * dpr, gx, -1.2, cols * CW, rows * CH);
+    }
+    ctx.restore();
+  }
+
+  function updateUI() {
+    const hud = document.getElementById("hud");
+    if (ended) {
+      hud.style.display = "flex";
+      hud.classList.remove("show-cta");
+      // Force reflow so the CTA entrance animation can replay after each run.
+      void hud.offsetWidth;
+      hud.classList.add("show-cta");
+      hintEl.textContent = "圣诞快乐！";
+    } else {
+      hud.style.display = "none";
+      hud.classList.remove("show-cta");
+      hintEl.textContent = "圣诞树正在逐渐生成…";
+    }
+  }
+
+  function frame(now) {
+    requestAnimationFrame(frame);
+    if (paused) return;
+
+    // 页面加载后从 0 秒开始播放，不再预览已经成型的圣诞树
+    const t = started ? (now - startAt) / 1000 : 0;
+    if (started) {
+      cue(t);
+      if (t > 13.5 && !ended) {
+        ended = true;
+        updateUI();
+      }
+    }
+    draw(t);
+    lastT = t;
+  }
+
+  function startFresh() {
+    audioStart();
+    started = true;
+    ended = false;
+    paused = false;
+    startAt = performance.now();
+    lastT = 0;
+    stepBell = 0;
+    prevCue = -1;
+    updateUI();
+  }
+
+  function togglePlayPause() {
+    if (!started || ended) {
+      startFresh();
+    } else {
+      paused = !paused;
+      if (paused) {
+        pauseAt = performance.now();
+        if (audio && audio.state === "running") audio.suspend();
+      } else {
+        startAt += performance.now() - pauseAt;
+        if (audio && audio.state === "suspended") audio.resume();
+      }
+      updateUI();
+    }
+  }
+
+  btnReplay.addEventListener("click", e => {
+    e.stopPropagation();
+    startFresh();
+  });
+
+  window.addEventListener("keydown", e => {
+    if ((e.code === "Enter" || e.code === "Space" || e.key.toLowerCase() === "r") && ended) {
+      e.preventDefault();
+      startFresh();
+    }
+  });
+
+  // 首次进入页面自动播放：舞台先出现，随后树干、枝叶、星星和彩灯依次生成。
+  startFresh();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
